@@ -104,6 +104,10 @@ if(new URLSearchParams(window.location.search).get('s')){qsize = new URLSearchPa
 var qcomplexity = R.random_int(1,10);
 if(new URLSearchParams(window.location.search).get('d')){qcomplexity = new URLSearchParams(window.location.search).get('d')}; //size
 qcomplexity = qcomplexity+3;
+var qvariation = 10;
+if(new URLSearchParams(window.location.search).get('v')){qvariation = parseInt(new URLSearchParams(window.location.search).get('v'))}; //cell size variation
+var qweighting = 0;
+if(new URLSearchParams(window.location.search).get('wt')){qweighting = parseInt(new URLSearchParams(window.location.search).get('wt'))}; //weighted/power voronoi focal strength
 
 var qorientation =R.random_int(1,2) < 2 ? "portrait" : "landscape";
 var qframecolor = R.random_int(0,3) < 1 ? "White" : R.random_int(1,3) < 2 ? "Mocha" : "Random";     
@@ -192,7 +196,29 @@ definitions = [
             min: 3,
             max: 13,
             step: 1,
-        },  
+        },
+    },
+    {
+        id: "variation",
+        name: "Cell size variation",
+        type: "number",
+        default: qvariation,
+        options: {
+            min: 1,
+            max: 10,
+            step: 1,
+        },
+    },
+    {
+        id: "weighting",
+        name: "Weighted focal points",
+        type: "number",
+        default: qweighting,
+        options: {
+            min: 0,
+            max: 10,
+            step: 1,
+        },
     },
     {
         id: "matwidth",
@@ -334,7 +360,10 @@ var px=0;var py=0;var pz=0;var prange=.1;
             return out;
         }
 
-        // Build one Voronoi cell by intersecting half-planes against every other site.
+        // Build one (power) Voronoi cell by intersecting half-planes against every other site.
+        // Sites may carry a weight w; bisector shifts toward the lighter site.
+        // Power diagram: point p is in site s_i's cell iff |p-s_i|^2 - w_i <= |p-s_j|^2 - w_j.
+        // That simplifies to a linear half-plane with the midpoint shifted along (s_j - s_i).
         function computeVoronoiCell(idx, siteList) {
             var cell = [
                 {x: bbox.minX, y: bbox.minY},
@@ -343,13 +372,17 @@ var px=0;var py=0;var pz=0;var prange=.1;
                 {x: bbox.minX, y: bbox.maxY}
             ];
             var s = siteList[idx];
+            var sw = s.w || 0;
             for (var i = 0; i < siteList.length; i++) {
                 if (i === idx) continue;
                 var p = siteList[i];
-                var mx = (s.x + p.x) * 0.5;
-                var my = (s.y + p.y) * 0.5;
                 var dx = p.x - s.x;
                 var dy = p.y - s.y;
+                var d2 = dx*dx + dy*dy;
+                if (d2 < 1e-9) continue;
+                var wShift = (sw - (p.w || 0)) / (2 * d2);
+                var mx = (s.x + p.x) * 0.5 + wShift * dx;
+                var my = (s.y + p.y) * 0.5 + wShift * dy;
                 cell = clipHalfPlane(cell, mx, my, dx, dy);
                 if (cell.length < 3) return null;
             }
@@ -401,21 +434,67 @@ var px=0;var py=0;var pz=0;var prange=.1;
         for (var si = 0; si < numSites; si++) {
             sites.push({
                 x: bbox.minX + R.random_dec() * (bbox.maxX - bbox.minX),
-                y: bbox.minY + R.random_dec() * (bbox.maxY - bbox.minY)
+                y: bbox.minY + R.random_dec() * (bbox.maxY - bbox.minY),
+                w: 0
             });
         }
 
-        // Two rounds of Lloyd's relaxation for more even cells
-        for (var iter = 0; iter < 2; iter++) {
+        // Partial Lloyd's relaxation — variation controls how far each iteration
+        // moves a site toward its cell centroid.
+        // variation 1 = full relaxation (even cells), 10 = minimal relaxation
+        // (nearly raw random distribution = significant size variation).
+        var variation = $fx.getParam('variation');
+        var variationT = (variation - 1) / 9; // 0..1
+        var blend = 1.0 - variationT * 0.96; // 1.0 at v=1, 0.04 at v=10
+        var relaxIters = 4;
+        for (var iter = 0; iter < relaxIters; iter++) {
             var relaxed = [];
             for (var i = 0; i < sites.length; i++) {
                 var vc = computeVoronoiCell(i, sites);
                 if (!vc) { relaxed.push(sites[i]); continue; }
                 var cc = polygonCentroid(vc);
                 if (!cc) { relaxed.push(sites[i]); continue; }
-                relaxed.push({x: cc.x, y: cc.y});
+                relaxed.push({
+                    x: sites[i].x + (cc.x - sites[i].x) * blend,
+                    y: sites[i].y + (cc.y - sites[i].y) * blend,
+                    w: sites[i].w
+                });
             }
             sites = relaxed;
+        }
+
+        // Power Voronoi — assign large weights to a handful of focal sites so
+        // they dominate their neighborhood, creating intentional focal cells.
+        var weighting = $fx.getParam('weighting');
+        if (weighting > 0) {
+            // Number of focal sites grows with weighting strength
+            var focalCount = Math.max(1, Math.floor(sites.length * 0.03 + weighting * 0.5));
+            if (focalCount > sites.length) focalCount = sites.length;
+            // Base weight magnitude in squared-distance units (power diagram)
+            var baseWeight = avgCellSize * avgCellSize * weighting * 0.35;
+
+            // Deterministic Fisher-Yates shuffle over $fx.rand
+            var focalIndices = [];
+            for (var fi = 0; fi < sites.length; fi++) focalIndices.push(fi);
+            for (var fi = focalIndices.length - 1; fi > 0; fi--) {
+                var fj = Math.floor(R.random_dec() * (fi + 1));
+                var ftmp = focalIndices[fi]; focalIndices[fi] = focalIndices[fj]; focalIndices[fj] = ftmp;
+            }
+            for (var fk = 0; fk < focalCount; fk++) {
+                var idx = focalIndices[fk];
+                // Cap weight at 70% of nearest-neighbor distance squared so the
+                // neighbor still retains a visible cell instead of being swallowed.
+                var nearestD2 = Infinity;
+                for (var fj = 0; fj < sites.length; fj++) {
+                    if (fj === idx) continue;
+                    var fdx = sites[fj].x - sites[idx].x;
+                    var fdy = sites[fj].y - sites[idx].y;
+                    var fd2 = fdx*fdx + fdy*fdy;
+                    if (fd2 < nearestD2) nearestD2 = fd2;
+                }
+                var desired = baseWeight * R.random_num(0.6, 1.0);
+                sites[idx].w = Math.min(nearestD2 * 0.7, desired);
+            }
         }
 
         // Final cells with per-cell attributes
@@ -425,14 +504,19 @@ var px=0;var py=0;var pz=0;var prange=.1;
             var polygon = computeVoronoiCell(i, sites);
             if (!polygon || polygon.length < 3) continue;
 
-            // inradius estimate = half distance to nearest site
+            // inradius estimate = distance from site to its nearest weighted bisector.
+            // For a power diagram this is (|d|^2 + w_s - w_p) / (2|d|).
             var minDist = Infinity;
             for (var j = 0; j < sites.length; j++) {
                 if (j === i) continue;
-                var dd = Math.hypot(sites[i].x - sites[j].x, sites[i].y - sites[j].y);
-                if (dd < minDist) minDist = dd;
+                var ddx = sites[j].x - sites[i].x;
+                var ddy = sites[j].y - sites[i].y;
+                var dd = Math.hypot(ddx, ddy);
+                if (dd < 1e-6) continue;
+                var weightedHalf = (dd * dd + (sites[i].w || 0) - (sites[j].w || 0)) / (2 * dd);
+                if (weightedHalf < minDist) minDist = weightedHalf;
             }
-            var inradius = minDist * 0.5;
+            var inradius = Math.max(1, minDist);
 
             // Depth (how many voronoi layers this cell cuts through).
             // Perlin noise seeded from $fx.rand gives spatially coherent variation.
@@ -441,8 +525,8 @@ var px=0;var py=0;var pz=0;var prange=.1;
             var depthNoise = noise.get(nxs, nys); // 0..1-ish
             if (depthNoise < 0) depthNoise = 0;
             if (depthNoise > 1) depthNoise = 1;
-            var minDepth = 1;
             var maxDepth = firstVoronoiLayer; // deepest cuts still leave layer 0 solid
+            var minDepth = Math.min(5, maxDepth); // don't stop sooner than 5 layers in
             var depth = minDepth + Math.floor(depthNoise * (maxDepth - minDepth + 1));
             if (depth > maxDepth) depth = maxDepth;
             if (depth < minDepth) depth = minDepth;
@@ -501,11 +585,13 @@ if (z < stacks - 1) {
         var depthSpan = firstVoronoiLayer - cell.endLayer;
         var shrinkRatio = depthSpan > 0 ? (distFromTop / depthSpan) : 0;
 
-        var maxInset = cell.inradius - cellGap;
-        if (maxInset <= 0) continue;
+        // Scale top-layer gap down for small cells so every cell still gets cut.
+        var topInset = Math.min(cellGap, cell.inradius * 0.4);
+        var maxInset = cell.inradius * 0.9;
+        if (maxInset <= topInset) { maxInset = topInset + 0.5; }
 
-        // Base gap between adjacent cells, then grow inward as z goes down.
-        var inset = cellGap + shrinkRatio * maxInset * 0.85;
+        // Baseline gap between cells on the top layer, then grow inward as z goes down.
+        var inset = topInset + shrinkRatio * (maxInset - topInset) * 0.95;
 
         var insetPoly = offsetPolygonClipper(cell.polygon, -inset);
         if (!insetPoly || insetPoly.length < 3) continue;
