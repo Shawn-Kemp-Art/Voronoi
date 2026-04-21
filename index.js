@@ -526,7 +526,7 @@ var px=0;var py=0;var pz=0;var prange=.1;
 
         // Final cells with per-cell attributes
         var cells = [];
-        var firstVoronoiLayer = stacks - 2; // top layer is frame-only
+        var firstVoronoiLayer = stacks - 1; // voronoi now cuts the top layer too
         // Depth variance: 0 = every cell cuts full depth, 10 = shallowest cells stop at ~3 layers.
         var depthvar = $fx.getParam('depthvar');
         var maxDepth = firstVoronoiLayer; // deepest cuts still leave layer 0 solid
@@ -633,7 +633,7 @@ for (z = 0; z < stacks; z++) {
     pz=z*prange;
     
     drawFrame(z); // Draw the initial frame
-    if (z < stacks - 1) solid(z); // top layer stays as frame only
+    solid(z);
 
          //-----Draw each layer
         if(z<stacks-1 && z!=0 ){
@@ -648,37 +648,35 @@ for (z = 0; z < stacks; z++) {
 
 
         
-if (z < stacks - 1) {
-    for (var i = 0; i < cells.length; i++) {
-        var cell = cells[i];
-        if (z < cell.endLayer) continue; // this cell terminates above z — keep solid here (shows color)
+for (var i = 0; i < cells.length; i++) {
+    var cell = cells[i];
+    if (z < cell.endLayer) continue; // this cell terminates above z — keep solid here (shows color)
 
-        // Shrink ratio: 0 on the top voronoi layer, 1 on the cell's deepest cut layer.
-        var distFromTop = firstVoronoiLayer - z;
-        var depthSpan = firstVoronoiLayer - cell.endLayer;
-        var shrinkRatio = depthSpan > 0 ? (distFromTop / depthSpan) : 0;
+    // Shrink ratio: 0 on the top voronoi layer, 1 on the cell's deepest cut layer.
+    var distFromTop = firstVoronoiLayer - z;
+    var depthSpan = firstVoronoiLayer - cell.endLayer;
+    var shrinkRatio = depthSpan > 0 ? (distFromTop / depthSpan) : 0;
 
-        // Top-layer inset — small absolute gap between cells.
-        var topInset = Math.min(cellGap, cell.inradius * 0.4);
-        // Deepest-layer inset chosen so the terminal polygon has radius ~cell.terminalR.
-        // Minimum terminal radius of 2 keeps Clipper stable while still "pinpoint" visually.
-        var finalInset = cell.inradius - cell.terminalR;
-        if (finalInset < topInset + 0.5) finalInset = topInset + 0.5;
-        var maxFinalInset = cell.inradius - 2;
-        if (finalInset > maxFinalInset) finalInset = maxFinalInset;
+    // Top-layer inset — small absolute gap between cells.
+    var topInset = Math.min(cellGap, cell.inradius * 0.4);
+    // Deepest-layer inset chosen so the terminal polygon has radius ~cell.terminalR.
+    // Minimum terminal radius of 2 keeps Clipper stable while still "pinpoint" visually.
+    var finalInset = cell.inradius - cell.terminalR;
+    if (finalInset < topInset + 0.5) finalInset = topInset + 0.5;
+    var maxFinalInset = cell.inradius - 2;
+    if (finalInset > maxFinalInset) finalInset = maxFinalInset;
 
-        var inset = topInset + shrinkRatio * (finalInset - topInset);
+    var inset = topInset + shrinkRatio * (finalInset - topInset);
 
-        var insetPoly = offsetPolygonClipper(cell.polygon, -inset);
-        if (!insetPoly || insetPoly.length < 3) continue;
+    var insetPoly = offsetPolygonClipper(cell.polygon, -inset);
+    if (!insetPoly || insetPoly.length < 3) continue;
 
-        var segs = new Array(insetPoly.length);
-        for (var k = 0; k < insetPoly.length; k++) {
-            segs[k] = new Point(insetPoly[k].x, insetPoly[k].y);
-        }
-        var cellPath = new Path({segments: segs, closed: true});
-        cut(z, cellPath);
+    var segs = new Array(insetPoly.length);
+    for (var k = 0; k < insetPoly.length; k++) {
+        segs[k] = new Point(insetPoly[k].x, insetPoly[k].y);
     }
+    var cellPath = new Path({segments: segs, closed: true});
+    cut(z, cellPath);
 }
 
     frameIt(z);// finish the layer with a final frame cleanup 
