@@ -104,10 +104,14 @@ if(new URLSearchParams(window.location.search).get('s')){qsize = new URLSearchPa
 var qcomplexity = R.random_int(1,10);
 if(new URLSearchParams(window.location.search).get('d')){qcomplexity = new URLSearchParams(window.location.search).get('d')}; //size
 qcomplexity = qcomplexity+3;
-var qvariation = 10;
+var qvariation = R.random_int(0,10);
 if(new URLSearchParams(window.location.search).get('v')){qvariation = parseInt(new URLSearchParams(window.location.search).get('v'))}; //cell size variation
-var qweighting = 0;
+var qweighting = R.random_int(0,10);
 if(new URLSearchParams(window.location.search).get('wt')){qweighting = parseInt(new URLSearchParams(window.location.search).get('wt'))}; //weighted/power voronoi focal strength
+var qdepthvar = R.random_int(0,10);
+if(new URLSearchParams(window.location.search).get('dv')){qdepthvar = parseInt(new URLSearchParams(window.location.search).get('dv'))}; //depth variance: 0 = all cells cut full depth, 10 = some cells only cut ~3 layers
+var qtermstyle = R.random_int(1,10);
+if(new URLSearchParams(window.location.search).get('ts')){qtermstyle = parseInt(new URLSearchParams(window.location.search).get('ts'))}; //termination style: 1 = cells stop with large polygons, 10 = cells shrink to tiny points
 
 var qorientation =R.random_int(1,2) < 2 ? "portrait" : "landscape";
 var qframecolor = R.random_int(0,3) < 1 ? "White" : R.random_int(1,3) < 2 ? "Mocha" : "Random";     
@@ -216,6 +220,28 @@ definitions = [
         default: qweighting,
         options: {
             min: 0,
+            max: 10,
+            step: 1,
+        },
+    },
+    {
+        id: "depthvar",
+        name: "Depth variance",
+        type: "number",
+        default: qdepthvar,
+        options: {
+            min: 0,
+            max: 10,
+            step: 1,
+        },
+    },
+    {
+        id: "termstyle",
+        name: "Termination style",
+        type: "number",
+        default: qtermstyle,
+        options: {
+            min: 1,
             max: 10,
             step: 1,
         },
@@ -463,15 +489,19 @@ var px=0;var py=0;var pz=0;var prange=.1;
             sites = relaxed;
         }
 
-        // Power Voronoi — assign large weights to a handful of focal sites so
-        // they dominate their neighborhood, creating intentional focal cells.
+        // Power Voronoi — weight each focal site proportional to its own local
+        // spacing so the effect stays consistent across densities.
+        // For two sites A, B at distance d: weight w on A extends A's cell boundary
+        // from d/2 to d/2 + w/(2d). So radius multiplier = 1 + w/d^2.
+        // We set w = focalMult * d_nearest^2.
+        //   wt=1  -> focalMult ~ 0.3  (~1.3x radius, subtle)
+        //   wt=10 -> focalMult ~ 5.0  (~6x radius, strongly dominant)
         var weighting = $fx.getParam('weighting');
+        console.log('weighting: ' + weighting);
         if (weighting > 0) {
-            // Number of focal sites grows with weighting strength
             var focalCount = Math.max(1, Math.floor(sites.length * 0.03 + weighting * 0.5));
             if (focalCount > sites.length) focalCount = sites.length;
-            // Base weight magnitude in squared-distance units (power diagram)
-            var baseWeight = avgCellSize * avgCellSize * weighting * 0.35;
+            var focalMult = 0.3 + (weighting - 1) * (4.7 / 9);
 
             // Deterministic Fisher-Yates shuffle over $fx.rand
             var focalIndices = [];
@@ -482,8 +512,6 @@ var px=0;var py=0;var pz=0;var prange=.1;
             }
             for (var fk = 0; fk < focalCount; fk++) {
                 var idx = focalIndices[fk];
-                // Cap weight at 70% of nearest-neighbor distance squared so the
-                // neighbor still retains a visible cell instead of being swallowed.
                 var nearestD2 = Infinity;
                 for (var fj = 0; fj < sites.length; fj++) {
                     if (fj === idx) continue;
@@ -492,29 +520,58 @@ var px=0;var py=0;var pz=0;var prange=.1;
                     var fd2 = fdx*fdx + fdy*fdy;
                     if (fd2 < nearestD2) nearestD2 = fd2;
                 }
-                var desired = baseWeight * R.random_num(0.6, 1.0);
-                sites[idx].w = Math.min(nearestD2 * 0.7, desired);
+                sites[idx].w = nearestD2 * focalMult * R.random_num(0.6, 1.0);
             }
         }
 
         // Final cells with per-cell attributes
         var cells = [];
         var firstVoronoiLayer = stacks - 2; // top layer is frame-only
+        // Depth variance: 0 = every cell cuts full depth, 10 = shallowest cells stop at ~3 layers.
+        var depthvar = $fx.getParam('depthvar');
+        var maxDepth = firstVoronoiLayer; // deepest cuts still leave layer 0 solid
+        var minDepth = maxDepth - Math.floor((maxDepth - 3) * (depthvar / 10));
+        if (minDepth < 3) minDepth = 3;
+        if (minDepth > maxDepth) minDepth = maxDepth;
+        // Termination style: 1 = cells stop with large terminal polygons,
+        // 10 = cells shrink to tiny absolute-size points regardless of cell size.
+        // We target a terminal polygon radius directly — so focal (big) cells
+        // also shrink small at ts=10 instead of always being 10% of their inradius.
+        var termstyle = $fx.getParam('termstyle');
+        var termT = (termstyle - 1) / 9; // 0..1
         for (var i = 0; i < sites.length; i++) {
             var polygon = computeVoronoiCell(i, sites);
             if (!polygon || polygon.length < 3) continue;
 
-            // inradius estimate = distance from site to its nearest weighted bisector.
-            // For a power diagram this is (|d|^2 + w_s - w_p) / (2|d|).
+            // Inradius: min perpendicular distance from the polygon CENTROID to any edge.
+            // Using the centroid (not the site) handles cells truncated by the bbox —
+            // sites can be very near a bbox edge while the cell is still visually large.
+            var cx = 0, cy = 0, cArea = 0;
+            for (var k = 0; k < polygon.length; k++) {
+                var ca = polygon[k];
+                var cb = polygon[(k + 1) % polygon.length];
+                var cross = ca.x * cb.y - cb.x * ca.y;
+                cArea += cross;
+                cx += (ca.x + cb.x) * cross;
+                cy += (ca.y + cb.y) * cross;
+            }
+            cArea *= 0.5;
+            if (Math.abs(cArea) > 1e-6) {
+                cx /= 6 * cArea;
+                cy /= 6 * cArea;
+            } else {
+                cx = sites[i].x; cy = sites[i].y;
+            }
             var minDist = Infinity;
-            for (var j = 0; j < sites.length; j++) {
-                if (j === i) continue;
-                var ddx = sites[j].x - sites[i].x;
-                var ddy = sites[j].y - sites[i].y;
-                var dd = Math.hypot(ddx, ddy);
-                if (dd < 1e-6) continue;
-                var weightedHalf = (dd * dd + (sites[i].w || 0) - (sites[j].w || 0)) / (2 * dd);
-                if (weightedHalf < minDist) minDist = weightedHalf;
+            for (var k = 0; k < polygon.length; k++) {
+                var a = polygon[k];
+                var b = polygon[(k + 1) % polygon.length];
+                var ex = b.x - a.x, ey = b.y - a.y;
+                var elen = Math.hypot(ex, ey);
+                if (elen < 1e-9) continue;
+                ex /= elen; ey /= elen;
+                var perp = Math.abs((cx - a.x) * ey - (cy - a.y) * ex);
+                if (perp < minDist) minDist = perp;
             }
             var inradius = Math.max(1, minDist);
 
@@ -525,8 +582,6 @@ var px=0;var py=0;var pz=0;var prange=.1;
             var depthNoise = noise.get(nxs, nys); // 0..1-ish
             if (depthNoise < 0) depthNoise = 0;
             if (depthNoise > 1) depthNoise = 1;
-            var maxDepth = firstVoronoiLayer; // deepest cuts still leave layer 0 solid
-            var minDepth = Math.min(5, maxDepth); // don't stop sooner than 5 layers in
             var depth = minDepth + Math.floor(depthNoise * (maxDepth - minDepth + 1));
             if (depth > maxDepth) depth = maxDepth;
             if (depth < minDepth) depth = minDepth;
@@ -535,11 +590,29 @@ var px=0;var py=0;var pz=0;var prange=.1;
             var endLayer = firstVoronoiLayer - (depth - 1);
             if (endLayer < 1) endLayer = 1;
 
+            // terminalR: target radius of the cell's polygon at its deepest cut.
+            // At ts=10 this is a small absolute value (≈ cellGap*2), so even focal
+            // cells shrink to a tiny point. At ts=1 it's ~inradius*0.5, leaving a
+            // large polygon visible. Per-cell variation via perlin noise.
+            var termNoise = noise.get(sites[i].x * prange * 0.4 + 1000,
+                                      sites[i].y * prange * 0.4 + 1000);
+            if (termNoise < 0) termNoise = 0;
+            if (termNoise > 1) termNoise = 1;
+            var smallR = 2; // near-zero absolute terminal radius at ts=10
+            var largeR = Math.max(smallR + 1, inradius * 0.5);
+            // Linear ts blend for mean; spread is biggest at ts=5.5, zero at extremes.
+            var centerR = largeR * (1 - termT) + smallR * termT;
+            var spreadHalf = Math.min(termT, 1 - termT) * (largeR - smallR);
+            var terminalR = centerR + (termNoise - 0.5) * 2 * spreadHalf;
+            if (terminalR < smallR) terminalR = smallR;
+            if (terminalR > largeR) terminalR = largeR;
+
             cells.push({
                 site: sites[i],
                 polygon: polygon,
                 inradius: inradius,
-                endLayer: endLayer
+                endLayer: endLayer,
+                terminalR: terminalR
             });
         }
         console.log('Voronoi cells: ' + cells.length);
@@ -585,13 +658,16 @@ if (z < stacks - 1) {
         var depthSpan = firstVoronoiLayer - cell.endLayer;
         var shrinkRatio = depthSpan > 0 ? (distFromTop / depthSpan) : 0;
 
-        // Scale top-layer gap down for small cells so every cell still gets cut.
+        // Top-layer inset — small absolute gap between cells.
         var topInset = Math.min(cellGap, cell.inradius * 0.4);
-        var maxInset = cell.inradius * 0.9;
-        if (maxInset <= topInset) { maxInset = topInset + 0.5; }
+        // Deepest-layer inset chosen so the terminal polygon has radius ~cell.terminalR.
+        // Minimum terminal radius of 2 keeps Clipper stable while still "pinpoint" visually.
+        var finalInset = cell.inradius - cell.terminalR;
+        if (finalInset < topInset + 0.5) finalInset = topInset + 0.5;
+        var maxFinalInset = cell.inradius - 2;
+        if (finalInset > maxFinalInset) finalInset = maxFinalInset;
 
-        // Baseline gap between cells on the top layer, then grow inward as z goes down.
-        var inset = topInset + shrinkRatio * (maxInset - topInset) * 0.95;
+        var inset = topInset + shrinkRatio * (finalInset - topInset);
 
         var insetPoly = offsetPolygonClipper(cell.polygon, -inset);
         if (!insetPoly || insetPoly.length < 3) continue;
