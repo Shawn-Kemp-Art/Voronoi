@@ -714,7 +714,11 @@ for (var i = 0; i < cells.length; i++) {
     //$fx.preview();
 
 //Begin send to studio.shawnkemp.art **************************************************************
-     studioAPI.setApiBase('https://studio-shawnkemp-art.vercel.app');
+     // Only set the API base if the renderer hasn't injected one — otherwise we
+     // clobber __STUDIO_API_BASE__ and push artifacts to the wrong environment.
+     if (!window.__STUDIO_API_BASE__) {
+         studioAPI.setApiBase('https://studio-shawnkemp-art.vercel.app');
+     }
      if(new URLSearchParams(window.location.search).get('skart')){sendAllExports()};
 //End send to studio.shawnkemp.art **************************************************************
 
